@@ -43,6 +43,10 @@ Each engine implements the `hook_port_*` calls in `hook_engine.h`, in
 plain values, mark a register as a plain value, and log. In the fuzzer the
 marking calls are empty; in the concolic executor they update symbolic state.
 
+The port has no architecture code. `arm/abi.c` passes a register as a pointer
+into the CPU state (`&env->regs[0]`), and the port finds that register's
+symbolic value from there. A new architecture needs only `<arch>/abi.c`.
+
 ## Updating consumers
 
 1. Commit and push the hook change here.

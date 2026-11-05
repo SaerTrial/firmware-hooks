@@ -31,9 +31,11 @@ uint64_t hook_read_reg(CPUState *cs, unsigned reg)
 
 void hook_write_reg(CPUState *cs, unsigned reg, uint64_t val)
 {
+    CPUARMState *env = cpu_env(cs);
+
     g_assert(reg < ARRAY_SIZE(reg_names));
-    cpu_env(cs)->regs[reg] = val;
-    hook_port_reg_concrete(cs, reg);    /* the old symbolic value is gone */
+    env->regs[reg] = val;
+    hook_port_reg_concrete(cs, &env->regs[reg]);    /* the old symbolic value is gone */
 }
 
 uint64_t hook_arg(CPUState *cs, unsigned n)

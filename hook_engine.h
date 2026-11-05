@@ -21,11 +21,12 @@ int hook_reg_index(const char *name);
 vaddr hook_arch_entry(uint64_t addr);   /* configured address -> block-entry PC */
 void hook_arch_return(CPUState *cs);    /* PC := return address */
 
-/* The port (hw/<engine>/hook_port.c). */
+/* The port (hw/<engine>/hook_port.c). It knows no architecture: abi.c says
+ * where a register lives, as a pointer into the CPU state. */
 uint64_t hook_port_take_input(uint8_t *buf, size_t len); /* -> input offset of buf[0]; exits when input runs out */
 void hook_port_mem_input(void *host, size_t len, uint64_t offset); /* host[i] holds input byte offset+i */
 void hook_port_mem_concrete(void *host, size_t len);     /* host bytes hold plain values now */
-void hook_port_reg_concrete(CPUState *cs, unsigned reg); /* register holds a plain value now */
+void hook_port_reg_concrete(CPUState *cs, void *reg);    /* the register at `reg` holds a plain value now */
 void hook_port_log(const char *msg);
 
 #endif
