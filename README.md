@@ -1,56 +1,60 @@
 # Firmware hooks
 
-Shared ARM hook sources compiled into `SaerTrial/triforce-qemu` and
-`SaerTrial/concolic-executor`. Each engine includes this repository as its
-`hooks` Git submodule and builds `arm/function_hooks.c` alongside its own
-`hw/.../arm/hook_backend.c` adapter.
+Hooks that replace firmware functions in two QEMU-based engines:
+`SaerTrial/triforce-qemu` (the AFL fuzzer) and `SaerTrial/concolic-executor`
+(the concolic executor). Both include this repository as their `hooks`
+submodule, so a hook is written once and runs in both.
 
-The current registry contains `HAL_Delay` and `uart_printf`. Register-name
-parsing for firmware configuration is shared too. The extraction preserves
-the existing callback behavior, registration names, output and memory reads.
-In particular, `printf` is not an alias for `uart_printf`.
+The full design, with examples, is `docs/hook-api.md` in
+`SaerTrial/concolic-fuzzing`.
 
-## Engine adapter
+## Files
 
-Implement the declarations in `arm/hook_backend.h`:
+| File | Who uses it | What it holds |
+| --- | --- | --- |
+| `hooks.c` | you | The hooks: `stub`, `HAL_Delay`, `uart_recv`, `uart_printf`. |
+| `hook_api.h` | hooks | `FIRMWARE_HOOK`, arguments, return value, guest memory, input. |
+| `core.c` | engines | Hook registry, `symbols`/`patch` configuration, dispatch, page-by-page copies. |
+| `arm/abi.c` | core | ARM calling convention: r0-r3 then stack, r0 return, `bx lr`. |
+| `hook_engine.h` | engines | What engines call, and the five-call port they implement. |
 
-- `hook_read_register`: read the concrete ARM register value.
-- `hook_read_memory8`: use the engine's guest byte-load operation, including
-  MMIO side effects. Reading ordinary guest RAM does not consume fuzz input.
-- `hook_log_call`: emit the hook prefix through the engine's logging category,
-  preserving the supplied suffix.
+## Add a hook
 
-These are source interfaces compiled against each engine's QEMU headers, not
-a stable binary ABI. ARM-specific code stays in `arm/`; another architecture
-can provide its own directory and callback conventions later.
+```c
+/* hooks.c */
+FIRMWARE_HOOK(uart_recv)                 /* the name the configuration uses */
+{
+    hook_input_to_guest(cs, hook_arg(cs, 1), (uint16_t)hook_arg(cs, 2));
+    hook_set_ret(cs, 0);
+}
+```
 
-Neither current hook writes guest state or injects fuzz input into a guest
-buffer. A future receive hook must use an engine adapter that consumes the
-engine's existing input cursor and, for concolic execution, updates symbolic
-memory as well as concrete bytes. Plain C copies do not provide that behavior.
+```json
+"patch": [{"addr": "0x08004d50", "hook": "uart_recv"}]
+```
+
+Nothing else: no registration table, no engine code. An unknown name in a
+configuration stops both engines at startup and lists the registered hooks.
+
+## Engine port
+
+Each engine implements the `hook_port_*` calls in `hook_engine.h`, in
+`hw/<engine>/hook_port.c`: take input bytes, mark host bytes as input or as
+plain values, mark a register as a plain value, and log. In the fuzzer the
+marking calls are empty; in the concolic executor they update symbolic state.
+
+The port has no architecture code. `arm/abi.c` passes a register as a pointer
+into the CPU state (`&env->regs[0]`), and the port finds that register's
+symbolic value from there. A new architecture needs only `<arch>/abi.c`.
 
 ## Updating consumers
 
 1. Commit and push the hook change here.
-2. Update and commit the `hooks` gitlink in both QEMU forks to the same commit.
-3. Update both QEMU gitlinks in `concolic-fuzzing` and run its shared-hook check.
-4. Build both engines and compare each one's hook output and firmware execution
-   against its previous revision.
+2. Point the `hooks` gitlink of both QEMU forks at that same commit.
+3. Record both QEMU commits in `concolic-fuzzing`. Its build script refuses to
+   build when the two forks pin different hook commits.
 
-Do not make builds follow the latest branch automatically. Every consumer pins
-an exact hook commit. Hook logic is maintained here; engine adapters remain in
-their respective QEMU repositories.
+## License
 
-## Provenance and license
-
-Extracted from `SaerTrial/triforce-qemu` commit
-`abbe183b7a5723243aa8d3b9177c9f51cef47085`,
-`hw/rehosting/arm/function_hooks.{c,h}`. The corresponding implementation in
-`SaerTrial/concolic-executor` commit
-`b793b1601e032652a4afd4cf00c4c6047a4a7c96` differed only in logging category
-and whitespace. Original hook author: Zhanpeng Huang.
-
-The original files had no individual license notice; both source repositories'
-`LICENSE` places such QEMU source files under GPL version 2 or, at your option,
-any later version. These extracted sources retain `GPL-2.0-or-later`. See
-`COPYING` for the GPL version 2 text.
+GPL-2.0-or-later, as the QEMU sources these hooks were extracted from. See
+`COPYING`. Original hook author: Zhanpeng Huang.
