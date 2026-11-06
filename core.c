@@ -256,8 +256,8 @@ bool hook_dispatch(CPUState *cs, vaddr pc)
 
 /* ---- Guest memory ---- */
 
-/* Bytes from addr to the end of its guest page. Neighbouring guest pages need
- * not be neighbours in host memory, so no host copy may cross a page. */
+/* Bytes from addr to the end of its guest page. Neighbouring guest pages are not necessarily
+the neighbours in host memory, so some host copies may not cross a page. */
 static size_t page_chunk(vaddr addr, size_t len)
 {
     return MIN(len, -(addr | TARGET_PAGE_MASK));
