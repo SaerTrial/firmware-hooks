@@ -23,8 +23,13 @@ FIRMWARE_HOOK(HAL_Delay)
  */
 FIRMWARE_HOOK(uart_recv)
 {
-    hook_input_to_guest(cs, hook_arg(cs, 1), (uint16_t)hook_arg(cs, 2));
-    hook_set_ret(cs, 0);
+    uint64_t buf = hook_arg(cs, 1);
+    uint16_t len = hook_arg(cs, 2);
+
+    hook_log("uart_recv: buf=0x%" PRIx64 " len=%u\n", buf, len);
+
+    hook_input_to_guest(cs, buf, len);
+    hook_set_ret(cs, 0);    /* HAL_OK */
 }
 
 static void print_guest_string(CPUState *cs, vaddr addr)
