@@ -1,7 +1,8 @@
 /* SPDX-License-Identifier: GPL-2.0-or-later */
 /*
  * The contract between the shared hook code and an engine. Hooks never use it.
- *   engine -> hooks: load the configuration, dispatch at each translation block.
+ *   engine -> hooks: load the configuration, dispatch at each translation block,
+ *                    log MMIO input reads.
  *   hooks -> engine: the port, five small calls that each engine implements.
  */
 #ifndef FIRMWARE_HOOKS_HOOK_ENGINE_H
@@ -16,6 +17,15 @@ void hook_load_config(QDict *conf, const char *config_path);
 bool hook_dispatch(CPUState *cs, vaddr pc);
 /* Register number for a name such as "r0" or "PC"; -1 if unknown. */
 int hook_reg_index(const char *name);
+/*
+ * Log one read from the input tape, so the log shows who took which bytes:
+ *   input[1664]          hook uart_recv -> 0x2000ffe3
+ *   input[1665..1668]    MMIO 0x58023014 = 0xfcfcfcfc
+ * Hook reads log themselves; engines call this for each MMIO read. Without
+ * a -d option it returns at once.
+ */
+void hook_log_input(uint64_t offset, size_t len, const char *fmt, ...)
+    G_GNUC_PRINTF(3, 4);
 
 /* Architecture ABI used by the shared code (hooks/<arch>/abi.c). */
 vaddr hook_arch_entry(uint64_t addr);   /* configured address -> block-entry PC */

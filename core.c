@@ -2,6 +2,7 @@
 /* Shared hook machinery: registry, configuration, dispatch and guest memory. */
 #include "qemu/osdep.h"
 #include "qemu/error-report.h"
+#include "qemu/log.h"
 #include "qapi/qmp/qlist.h"
 #include "qapi/qmp/qnum.h"
 #include "qapi/qmp/qstring.h"
@@ -33,15 +34,43 @@ void hook_register(const char *name, hook_fn fn)
     g_hash_table_insert(hooks, (gpointer)name, fn);
 }
 
+/* True if a -d option is on. QEMU's log trace backend always sets LOG_TRACE. */
+static bool logging(void)
+{
+    return qemu_loglevel_mask(~LOG_TRACE);
+}
+
+/* Both log calls run on every hook call, so they format nothing without -d. */
 void hook_log(const char *fmt, ...)
 {
     g_autofree char *msg = NULL;
     va_list ap;
 
+    if (!logging()) {
+        return;
+    }
     va_start(ap, fmt);
     msg = g_strdup_vprintf(fmt, ap);
     va_end(ap);
     hook_port_log(msg);
+}
+
+/* "input[k]" for one byte, "input[k..k+len-1]" for more: the names the
+ * concolic executor gives these bytes. Then who took them. */
+void hook_log_input(uint64_t offset, size_t len, const char *fmt, ...)
+{
+    g_autofree char *name = NULL, *reader = NULL;
+    va_list ap;
+
+    if (!logging()) {
+        return;
+    }
+    name = len == 1 ? g_strdup_printf("input[%" PRIu64 "]", offset) :
+        g_strdup_printf("input[%" PRIu64 "..%" PRIu64 "]", offset, offset + len - 1);
+    va_start(ap, fmt);
+    reader = g_strdup_vprintf(fmt, ap);
+    va_end(ap);
+    hook_log("%-20s %s\n", name, reader);
 }
 
 /* ---- Configuration ---- */
@@ -235,6 +264,8 @@ void hook_load_config(QDict *conf, const char *config_path)
 
 /* ---- Dispatch ---- */
 
+static const char *running_hook;    /* hooks run only from here; input logs name it */
+
 bool hook_dispatch(CPUState *cs, vaddr pc)
 {
     static unsigned calls;      /* numbers hook calls: [uart_recv_3] */
@@ -246,6 +277,7 @@ bool hook_dispatch(CPUState *cs, vaddr pc)
     printf("[%s_%u]\n", p->hook, calls);
     fflush(stdout);             /* input exhaustion leaves through _exit() */
     hook_log("[%s_%u]\n", p->hook, calls++);
+    running_hook = p->hook;
     p->fn(cs);
     if (p->has_ret) {
         hook_set_ret(cs, p->ret);
@@ -324,5 +356,6 @@ void hook_input_to_guest(CPUState *cs, vaddr addr, size_t len)
     }
     buf = g_malloc(len);
     offset = hook_port_take_input(buf, len);
+    hook_log_input(offset, len, "hook %s -> 0x%08" VADDR_PRIx, running_hook, addr);
     copy_to_guest(cs, addr, buf, len, offset);
 }
