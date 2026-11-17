@@ -27,6 +27,26 @@ int hook_reg_index(const char *name);
 void hook_log_input(uint64_t offset, size_t len, const char *fmt, ...)
     G_GNUC_PRINTF(3, 4);
 
+/*
+ * The "boot" section: what a good boot is, and where it ends (boot.target).
+ * With boot.input, boot runs once from that file and fuzzing starts at the
+ * target. Without it, the section only judges each run's boot.
+ */
+typedef enum HookBoot {
+    HOOK_BOOT_GO,       /* nothing to do */
+    HOOK_BOOT_FAILED,   /* no boot.input: an avoid address was reached; end this run */
+    HOOK_BOOT_SWITCH,   /* boot.input: the target is reached; switch to the fuzz input */
+} HookBoot;
+
+/* Call at every block start; `offset` is the input position. With boot.input,
+ * a boot that fails a check stops the engine with an error. */
+HookBoot hook_boot_block(vaddr pc, uint64_t offset);
+/* True while input reads are served from boot.input, as plain values. */
+bool hook_booting(void);
+const char *hook_boot_input(void);      /* path of boot.input, or NULL */
+/* "boot: <file> <message>" and exit(1): the boot input does not fit. */
+G_NORETURN void hook_boot_fail(const char *fmt, ...) G_GNUC_PRINTF(1, 2);
+
 /* Architecture ABI used by the shared code (hooks/<arch>/abi.c). */
 vaddr hook_arch_entry(uint64_t addr);   /* configured address -> block-entry PC */
 void hook_arch_return(CPUState *cs);    /* PC := return address */
