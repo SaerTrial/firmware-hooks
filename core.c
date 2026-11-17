@@ -1,6 +1,7 @@
 /* SPDX-License-Identifier: GPL-2.0-or-later */
 /* Shared hook machinery: registry, configuration, dispatch and guest memory. */
 #include "qemu/osdep.h"
+#include <glib/gstdio.h>
 #include "qemu/error-report.h"
 #include "qemu/log.h"
 #include "qapi/qmp/qlist.h"
@@ -24,6 +25,18 @@ typedef struct Patch {
 static GHashTable *hooks;       /* hook name -> hook_fn */
 static GHashTable *symbols;     /* symbol name -> address */
 static GHashTable *patches;     /* block-entry PC -> Patch */
+
+#define BOOT_MAX_BLOCKS 10000000    /* with boot.input: give up on a boot that hangs */
+
+/* The "boot" section. `active` from startup until the target is first reached. */
+static struct {
+    bool active;
+    vaddr target;
+    GHashTable *required;       /* block-entry PC -> seen yet? */
+    GHashTable *avoid;          /* block-entry PCs of a failed boot */
+    char *input;                /* boot.input path, or NULL: only judge each run's boot */
+    uint64_t blocks, reads;     /* counted while booting from boot.input */
+} boot;
 
 void hook_register(const char *name, hook_fn fn)
 {
@@ -56,17 +69,20 @@ void hook_log(const char *fmt, ...)
 }
 
 /* "input[k]" for one byte, "input[k..k+len-1]" for more: the names the
- * concolic executor gives these bytes. Then who took them. */
+ * concolic executor gives these bytes. Then who took them. Bytes taken from
+ * boot.input are "boot[k]": they are not part of the fuzz input. */
 void hook_log_input(uint64_t offset, size_t len, const char *fmt, ...)
 {
+    const char *tape = hook_booting() ? "boot" : "input";
     g_autofree char *name = NULL, *reader = NULL;
     va_list ap;
 
+    boot.reads += hook_booting();
     if (!logging()) {
         return;
     }
-    name = len == 1 ? g_strdup_printf("input[%" PRIu64 "]", offset) :
-        g_strdup_printf("input[%" PRIu64 "..%" PRIu64 "]", offset, offset + len - 1);
+    name = len == 1 ? g_strdup_printf("%s[%" PRIu64 "]", tape, offset) :
+        g_strdup_printf("%s[%" PRIu64 "..%" PRIu64 "]", tape, offset, offset + len - 1);
     va_start(ap, fmt);
     reader = g_strdup_vprintf(fmt, ap);
     va_end(ap);
@@ -151,6 +167,14 @@ static void load_symbol_file(const char *path)
     }
 }
 
+/* A file named in the configuration is looked up next to the configuration. */
+static char *config_file(const char *config_path, const char *name)
+{
+    g_autofree char *dir = g_path_get_dirname(config_path);
+
+    return g_path_is_absolute(name) ? g_strdup(name) : g_build_filename(dir, name, NULL);
+}
+
 /* "symbols": "file.syms" (next to the configuration) or {"name": "0x..."}. */
 static void load_symbols(QObject *obj, const char *config_path)
 {
@@ -158,10 +182,7 @@ static void load_symbols(QObject *obj, const char *config_path)
     QDict *inline_syms = qobject_to(QDict, obj);
 
     if (file) {
-        g_autofree char *dir = g_path_get_dirname(config_path);
-        const char *name = qstring_get_str(file);
-        g_autofree char *path = g_path_is_absolute(name) ?
-            g_strdup(name) : g_build_filename(dir, name, NULL);
+        g_autofree char *path = config_file(config_path, qstring_get_str(file));
 
         load_symbol_file(path);
     } else if (inline_syms) {
@@ -187,6 +208,20 @@ static char *hook_names(void)
     return g_string_free(s, false);
 }
 
+/* Block-entry PC of a name from the symbol list. */
+static vaddr symbol_pc(const char *sym, const char *where)
+{
+    gpointer v;
+
+    if (!g_hash_table_lookup_extended(symbols, sym, NULL, &v)) {
+        config_error("%s: symbol \"%s\" is not in the symbol list", where, sym);
+    }
+    if ((uintptr_t)v == AMBIGUOUS) {
+        config_error("%s: symbol \"%s\" has more than one address", where, sym);
+    }
+    return hook_arch_entry((uintptr_t)v);
+}
+
 /* {"addr": "0x..." | "symbol": "name", "hook": "name", "ret": value?} */
 static void add_patch(QDict *entry, int index)
 {
@@ -206,19 +241,7 @@ static void add_patch(QDict *entry, int index)
     if (!addr == !sym) {
         config_error("%s: give exactly one of \"addr\" and \"symbol\"", where);
     }
-    if (sym) {
-        gpointer v;
-
-        if (!g_hash_table_lookup_extended(symbols, sym, NULL, &v)) {
-            config_error("%s: symbol \"%s\" is not in the symbol list", where, sym);
-        }
-        if ((uintptr_t)v == AMBIGUOUS) {
-            config_error("%s: symbol \"%s\" has more than one address", where, sym);
-        }
-        pc = hook_arch_entry((uintptr_t)v);
-    } else {
-        pc = hook_arch_entry(config_num(addr, where));
-    }
+    pc = sym ? symbol_pc(sym, where) : hook_arch_entry(config_num(addr, where));
 
     p = g_new0(Patch, 1);
     p->fn = name && hooks ? g_hash_table_lookup(hooks, name) : NULL;
@@ -238,6 +261,81 @@ static void add_patch(QDict *entry, int index)
     hook_log("patch 0x%" VADDR_PRIx " -> %s\n", pc, p->hook);
 }
 
+/* An address in the boot section: a number, "0x0800043a", or a listed symbol. */
+static vaddr boot_pc(QObject *obj, const char *where)
+{
+    QString *s = qobject_to(QString, obj);
+
+    if (s && !g_ascii_isdigit(qstring_get_str(s)[0])) {
+        return symbol_pc(qstring_get_str(s), where);
+    }
+    return hook_arch_entry(config_num(obj, where));
+}
+
+/* A list of addresses, as a table keyed by block-entry PC (all values NULL). */
+static GHashTable *boot_pcs(QObject *obj, const char *where)
+{
+    GHashTable *pcs = g_hash_table_new(NULL, NULL);
+    QList *list = qobject_to(QList, obj);
+    QListEntry *e;
+    int i = 0;
+
+    if (obj && !list) {
+        config_error("%s: expected a list", where);
+    }
+    if (list) {
+        QLIST_FOREACH_ENTRY(list, e) {
+            g_autofree char *item = g_strdup_printf("%s[%d]", where, i++);
+            vaddr pc = boot_pc(qlist_entry_obj(e), item);
+
+            g_hash_table_insert(pcs, (gpointer)(uintptr_t)pc, NULL);
+        }
+    }
+    return pcs;
+}
+
+/* "boot": {"target": addr, "required": [addr]?, "avoid": [addr]?, "input": "file"?} */
+static void load_boot(QObject *obj, const char *config_path)
+{
+    static const char *const keys[] = {"target", "required", "avoid", "input", NULL};
+    QDict *conf = qobject_to(QDict, obj);
+    GStatBuf st;
+
+    if (!obj) {
+        return;
+    }
+    if (!conf) {
+        config_error("boot: expected an object");
+    }
+    for (const QDictEntry *e = qdict_first(conf); e; e = qdict_next(conf, e)) {
+        if (!g_strv_contains(keys, e->key)) {
+            config_error("boot: unknown key \"%s\"", e->key);
+        }
+    }
+    if (!qdict_haskey(conf, "target")) {
+        config_error("boot: \"target\" is missing");
+    }
+    boot.target = boot_pc(qdict_get(conf, "target"), "boot.target");
+    boot.required = boot_pcs(qdict_get(conf, "required"), "boot.required");
+    boot.avoid = boot_pcs(qdict_get(conf, "avoid"), "boot.avoid");
+    if (g_hash_table_contains(boot.avoid, (gpointer)(uintptr_t)boot.target)) {
+        config_error("boot: the target 0x%08" VADDR_PRIx " is also in \"avoid\"",
+                     boot.target);
+    }
+    if (qdict_haskey(conf, "input")) {
+        const char *name = qdict_get_try_str(conf, "input");
+
+        if (!name) {
+            config_error("boot.input: expected a file name");
+        }
+        boot.input = config_file(config_path, name);
+        if (g_stat(boot.input, &st) || !st.st_size) {
+            config_error("boot: cannot read %s, or it is empty", boot.input);
+        }
+    }
+    boot.active = true;
+}
+
 void hook_load_config(QDict *conf, const char *config_path)
 {
     QObject *obj = qdict_get(conf, "patch");
@@ -252,6 +350,7 @@ void hook_load_config(QDict *conf, const char *config_path)
     symbols = g_hash_table_new_full(g_str_hash, g_str_equal, g_free, NULL);
     patches = g_hash_table_new(NULL, NULL);
     load_symbols(qdict_get(conf, "symbols"), config_path);
+    load_boot(qdict_get(conf, "boot"), config_path);
     if (obj && !list) {
         config_error("patch: expected a list");
     }
@@ -260,6 +359,100 @@ void hook_load_config(QDict *conf, const char *config_path)
             add_patch(qobject_to(QDict, qlist_entry_obj(e)), i++);
         }
     }
+}
+
+/* ---- Boot ---- */
+
+bool hook_booting(void)
+{
+    return boot.active && boot.input;
+}
+
+const char *hook_boot_input(void)
+{
+    return boot.input;
+}
+
+void hook_boot_fail(const char *fmt, ...)
+{
+    g_autofree char *file = g_path_get_basename(boot.input);
+    g_autofree char *msg = NULL;
+    va_list ap;
+
+    va_start(ap, fmt);
+    msg = g_strdup_vprintf(fmt, ap);
+    va_end(ap);
+    error_report("boot: %s %s", file, msg);
+    exit(EXIT_FAILURE);
+}
+
+/* Is a required address still unseen? Reports the first one found. */
+static bool boot_missed(vaddr *pc)
+{
+    GHashTableIter it;
+    gpointer key, seen;
+
+    g_hash_table_iter_init(&it, boot.required);
+    while (g_hash_table_iter_next(&it, &key, &seen)) {
+        if (!seen) {
+            *pc = (uintptr_t)key;
+            return true;
+        }
+    }
+    return false;
+}
+
+/*
+ * Judge the boot, one block at a time. Without boot.input a bad boot is just
+ * a bad run: it is logged, and an avoid address ends it. With boot.input a
+ * bad boot means the file does not fit, which stops the engine.
+ */
+HookBoot hook_boot_block(vaddr pc, uint64_t offset)
+{
+    gpointer key = (gpointer)(uintptr_t)pc;
+    vaddr missed;
+
+    if (!boot.active) {
+        return HOOK_BOOT_GO;
+    }
+    if (g_hash_table_contains(boot.avoid, key)) {
+        if (boot.input) {
+            hook_boot_fail("reached avoid address 0x%08" VADDR_PRIx, pc);
+        }
+        hook_log("failed boot at input[%" PRIu64 "]: avoid address 0x%08" VADDR_PRIx
+                 " reached\n", offset, pc);
+        return HOOK_BOOT_FAILED;
+    }
+    if (g_hash_table_contains(boot.required, key)) {
+        g_hash_table_replace(boot.required, key, GINT_TO_POINTER(1));   /* seen */
+    }
+    if (pc != boot.target) {
+        if (boot.input && ++boot.blocks > BOOT_MAX_BLOCKS) {
+            hook_boot_fail("did not reach the boot target 0x%08" VADDR_PRIx " after %d "
+                           "blocks; is that address the start of a block?",
+                           boot.target, BOOT_MAX_BLOCKS);
+        }
+        return HOOK_BOOT_GO;
+    }
+
+    if (boot_missed(&missed)) {
+        if (boot.input) {
+            hook_boot_fail("reached the boot target without required address 0x%08"
+                           VADDR_PRIx, missed);
+        }
+        hook_log("passed boot at input[%" PRIu64 "]: required address 0x%08" VADDR_PRIx
+                 " not reached\n", offset, missed);
+    } else if (!boot.input) {
+        hook_log("passed boot at input[%" PRIu64 "]: all required addresses reached\n",
+                 offset);
+    } else {
+        g_autofree char *file = g_path_get_basename(boot.input);
+
+        hook_log("boot: %s passed boot (target 0x%08" VADDR_PRIx ") after %" PRIu64
+                 " reads, %" PRIu64 " bytes used\n", file, pc, boot.reads, offset);
+    }
+    boot.active = false;
+    return boot.input ? HOOK_BOOT_SWITCH : HOOK_BOOT_GO;
 }
 
 /* ---- Dispatch ---- */
@@ -357,5 +550,6 @@ void hook_input_to_guest(CPUState *cs, vaddr addr, size_t len)
     buf = g_malloc(len);
     offset = hook_port_take_input(buf, len);
     hook_log_input(offset, len, "hook %s -> 0x%08" VADDR_PRIx, running_hook, addr);
-    copy_to_guest(cs, addr, buf, len, offset);
+    /* Bytes from boot.input are plain values: only the fuzz input is named. */
+    copy_to_guest(cs, addr, buf, len, hook_booting() ? NO_INPUT : offset);
 }

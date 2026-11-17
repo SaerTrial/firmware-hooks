@@ -61,6 +61,16 @@ input[1665..1668]    MMIO 0x58023014 = 0xfcfcfcfc
 Hook reads log themselves in `core.c`. Each engine calls `hook_log_input` for
 its MMIO reads, so both engines write the same lines.
 
+## The boot section
+
+`core.c` also reads the optional `"boot"` section of the configuration and
+judges every run's boot at each block start (`hook_boot_block`): which
+`required` addresses were reached, whether an `avoid` address was, and when the
+`target` is reached. With `boot.input`, reads before the target take their
+bytes from that file (`hook_booting`), and the engine switches to the fuzz
+input at the target. `docs/firmware-configuration.md` in `concolic-fuzzing`
+describes the fields.
+
 ## Updating consumers
 
 1. Commit and push the hook change here.
